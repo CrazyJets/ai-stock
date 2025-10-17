@@ -165,7 +165,7 @@ def fetch_yahoo_news(symbol):
         return []
 
 def scrape_stockanalysis(symbol_for_stockanalysis):
-    url = f"https://stockanalysis.com/quote/{symbol_for_stockanalysis}/"
+    url = f"https://stockanalysis.com/quote/cose/{symbol_for_stockanalysis}/"
     try:
         res = requests.get(url, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')

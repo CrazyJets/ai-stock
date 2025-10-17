@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 import warnings
 warnings.filterwarnings('ignore')
 
-# Safe import of DuckDuckGo
+# Optional DuckDuckGo import
 try:
     from duckduckgo_search import ddg_news
     duckduckgo_available = True
@@ -27,6 +27,10 @@ def normalize_cse_ticker(ticker: str) -> str:
     if ticker and not ticker.upper().endswith(".CM"):
         return ticker.upper() + ".CM"
     return ticker.upper()
+
+def convert_for_stockanalysis(cse_ticker: str) -> str:
+    """Convert Yahoo Finance CSE ticker to StockAnalysis format"""
+    return cse_ticker.replace(".CM", "").replace("-", ".")
 
 @st.cache_resource
 def get_ticker_resource(tkr: str):
@@ -46,7 +50,7 @@ def get_yf_data(tkr: str, start: date, end: date):
         info = {}
     return hist, info
 
-# Calculate Indicators
+# Indicator calculation
 def calculate_indicators(df):
     df['SMA_20'] = df['Close'].rolling(20).mean()
     df['SMA_50'] = df['Close'].rolling(50).mean()
@@ -68,27 +72,6 @@ def calculate_indicators(df):
     df['Volatility'] = df['Close'].pct_change().rolling(10).std()*np.sqrt(252)*100
     return df
 
-def zigzag_with_signals(df, threshold=0.03):
-    df = df.copy()
-    df['ZigZag'] = np.nan
-    pivots = []
-    last_pivot = df['Close'].iloc[0]
-    direction = None
-    for i in range(1, len(df)):
-        price = df['Close'].iat[i]
-        change = (price-last_pivot)/last_pivot
-        if (direction != "up") and (change > threshold):
-            direction = "up"
-            last_pivot = price
-            df.at[df.index[i], "ZigZag"] = price
-            pivots.append((df.index[i], price, "buy"))
-        elif (direction != "down") and (change < -threshold):
-            direction = "down"
-            last_pivot = price
-            df.at[df.index[i], "ZigZag"] = price
-            pivots.append((df.index[i], price, "sell"))
-    return df, pivots
-
 def buy_sell_signal(df):
     latest_macd = df['MACD'].iloc[-1]
     latest_signal = df['MACD_signal'].iloc[-1]
@@ -100,32 +83,36 @@ def buy_sell_signal(df):
     else:
         return "HOLD", f"No strong signal, RSI {latest_rsi:.2f}"
 
-# AI Market Insights
 def ai_market_analysis(df, info, signal, reason):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
     pc = (latest['Close'] - prev['Close']) / prev['Close'] * 100
-    rsi = latest['RSI']
-    macd = latest['MACD']
-    macd_signal = latest['MACD_signal']
-    bb_upper = latest['BB_upper']
-    bb_lower = latest['BB_lower']
     vol_ratio = latest['Volume'] / latest['Vol_SMA'] if latest['Vol_SMA'] else 1
-
-    insights = [f"📊 Today change: {pc:+.2f}% → {signal} — {reason}"]
-    if rsi > 70: insights.append(f"⚠️ RSI {rsi:.1f} → Overbought risk")
-    elif rsi < 30: insights.append(f"💡 RSI {rsi:.1f} → Oversold opportunity")
-    if latest['Close'] > bb_upper: insights.append("🚀 Price above Bollinger Upper → Possible reversal")
-    elif latest['Close'] < bb_lower: insights.append("📉 Price below Bollinger Lower → Potential bounce")
-    if macd > macd_signal: insights.append("📈 MACD bullish momentum")
+    insights = [f"📊 Change: {pc:+.2f}% → {signal} — {reason}"]
+    if latest['RSI'] > 70: insights.append(f"⚠️ RSI {latest['RSI']:.1f} Overbought risk")
+    elif latest['RSI'] < 30: insights.append(f"💡 RSI {latest['RSI']:.1f} Oversold opportunity")
+    if latest['MACD'] > latest['MACD_signal']: insights.append("📈 MACD bullish momentum")
     else: insights.append("📉 MACD bearish momentum")
     if vol_ratio > 1.5: insights.append("🔥 High volume confirms strong move")
-    elif vol_ratio < 0.7: insights.append("📊 Weak volume, possible false move")
-    mcap = info.get('marketCap', 0)
-    if mcap > 1e11: insights.append("🏢 Large-cap stability")
-    elif mcap > 1e9: insights.append("🏭 Mid-cap balance")
-    else: insights.append("📈 Small-cap volatility")
+    elif vol_ratio < 0.7: insights.append("📊 Weak volume")
     return insights
+
+# Technical Strength Meter
+def calculate_strength(df):
+    latest = df.iloc[-1]
+    score = 50
+    if latest['RSI'] > 70: score -= 20
+    elif latest['RSI'] < 30: score += 20
+    if latest['MACD'] > latest['MACD_signal']: score += 15
+    else: score -= 15
+    # Bollinger position
+    if latest['Close'] > latest['BB_upper']: score -= 10
+    elif latest['Close'] < latest['BB_lower']: score += 10
+    # Volume
+    vol_ratio = latest['Volume'] / latest['Vol_SMA'] if latest['Vol_SMA'] else 1
+    if vol_ratio > 1.5: score += 5
+    elif vol_ratio < 0.7: score -= 5
+    return max(0, min(100, score))
 
 # ML Model
 class StockML:
@@ -148,12 +135,18 @@ class StockML:
     def predict_next(self, features):
         return self.model.predict(self.scaler.transform(features))[0]
 
-# News scraping
+# News & Bartleet Religare
 def scrape_site(url):
     try:
         res = requests.get(url, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
-        return [a.text.strip() for a in soup.find_all("a", href=True) if a.text.strip()]
+        links = []
+        for a in soup.find_all("a", href=True):
+            text = a.text.strip()
+            link = a['href']
+            if text and (link.endswith(".pdf") or link.endswith(".jpg") or link.endswith(".png") or "pdf" in link):
+                links.append((text, link))
+        return links
     except Exception:
         return []
 
@@ -171,10 +164,30 @@ def fetch_yahoo_news(symbol):
     except Exception:
         return []
 
+def scrape_stockanalysis(symbol_for_stockanalysis):
+    url = f"https://stockanalysis.com/quote/{symbol_for_stockanalysis}/"
+    try:
+        res = requests.get(url, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        summary = {}
+        summary['Name'] = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
+        smalls = soup.find_all("small")
+        if smalls:
+            summary['Description'] = smalls[0].get_text(strip=True)
+        divs = soup.find_all("div", class_="snapshot__item")
+        for d in divs:
+            label = d.find("div", class_="label")
+            value = d.find("div", class_="value")
+            if label and value:
+                summary[label.get_text(strip=True)] = value.get_text(strip=True)
+        return summary
+    except Exception:
+        return {}
+
 # Sidebar controls
-st.sidebar.title("📊 Controls")
+st.sidebar.title("📊 Dashboard Controls")
 upload_data = st.sidebar.file_uploader("📤 Upload CSV/Excel", type=["csv", "xlsx"])
-ticker_input = st.sidebar.text_input("Ticker", "AAPL")
+ticker_input = st.sidebar.text_input("Ticker", "WIND-N0000.CM")  # Yahoo format
 use_cse = st.sidebar.checkbox("🇱🇰 Use CSE format (.CM)", value=False)
 start_date = st.sidebar.date_input("Start Date", date(2024, 1, 1))
 end_date = st.sidebar.date_input("End Date", date.today())
@@ -182,7 +195,7 @@ show_prediction = st.sidebar.checkbox("🔮 Show ML Prediction", value=True)
 enable_news = st.sidebar.checkbox("📰 Show Market News", value=True)
 news_source = st.sidebar.selectbox("Choose News Source", ["DuckDuckGo", "Yahoo Finance", "EconomyNext business", "EconomyNext market", "Bartleet Religare"])
 
-# Data load
+# Load data
 if upload_data is not None:
     if upload_data.name.endswith(".csv"):
         hist = pd.read_csv(upload_data, parse_dates=[0])
@@ -198,15 +211,16 @@ if hist.empty:
     st.error("⚠️ No data found")
     st.stop()
 
-# Process indicators & signals
+# Process indicators
 hist = calculate_indicators(hist)
-hist, pivots = zigzag_with_signals(hist)
 signal, reason = buy_sell_signal(hist)
+score_strength = calculate_strength(hist)
 insights = ai_market_analysis(hist, info, signal, reason)
 
 # Tabs
-tabs = ["📈 Chart", "📊 Indicators Hub", "🧠 AI Analysis & Signals"]
-if enable_news: tabs.append("📰 News")
+tabs = ["📈 Chart", "📊 Indicators Hub", "🧠 AI Analysis & Strength Meter"]
+if enable_news: tabs.append("📰 News & Bartleet Religare")
+tabs.append("🏢 Company Details")
 t = st.tabs(tabs)
 
 # Chart tab
@@ -223,52 +237,32 @@ with t[0]:
 
 # Indicators Hub tab
 with t[1]:
-    st.subheader("📊 Latest Indicators Data")
     st.dataframe(hist.tail(15))
-    st.subheader("📈 Bollinger Bands")
-    fig_bb = go.Figure()
-    fig_bb.add_trace(go.Scatter(x=hist.index, y=hist['BB_upper'], line=dict(color='grey'), name='BB Upper'))
-    fig_bb.add_trace(go.Scatter(x=hist.index, y=hist['BB_lower'], line=dict(color='grey'), name='BB Lower', fill='tonexty', fillcolor='rgba(200,200,200,0.1)'))
-    fig_bb.add_trace(go.Scatter(x=hist.index, y=hist['Close'], line=dict(color='blue'), name='Close'))
-    st.plotly_chart(fig_bb, use_container_width=True)
-    st.subheader("🌡 Volatility Heat Map (%)")
-    fig_vol = go.Figure(go.Bar(x=hist.index, y=hist['Volatility'], marker_color=hist['Volatility'], marker=dict(colorscale='Reds')))
-    st.plotly_chart(fig_vol, use_container_width=True)
-    st.subheader("📊 MACD Histogram")
-    fig_macd = go.Figure(go.Bar(x=hist.index, y=hist['MACD_histogram'], marker_color=['green' if v>=0 else 'red' for v in hist['MACD_histogram']]))
-    st.plotly_chart(fig_macd, use_container_width=True)
-    st.subheader("📈 RSI Color Zones")
-    fig_rsi = go.Figure()
-    fig_rsi.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], line=dict(color='purple')))
-    fig_rsi.add_hrect(y0=70, y1=100, fillcolor="red", opacity=0.2)
-    fig_rsi.add_hrect(y0=0, y1=30, fillcolor="green", opacity=0.2)
-    st.plotly_chart(fig_rsi, use_container_width=True)
-    st.subheader("📦 Volume Trend")
-    st.line_chart(hist[['Volume','Vol_SMA']])
+    st.line_chart(hist[['MACD','MACD_signal']])
+    st.line_chart(hist['RSI'])
 
 # AI Analysis tab
 with t[2]:
-    if signal == "BUY":
-        st.success(f"✅ BUY — {reason}")
-    elif signal == "SELL":
-        st.error(f"❌ SELL — {reason}")
-    else:
-        st.warning(f"⚠️ HOLD — {reason}")
-    for insight in insights:
-        st.write(f"- {insight}")
-    if show_prediction:
-        ml = StockML()
-        res = ml.train(hist)
-        if res:
-            score, last_feat = res
-            pred = ml.predict_next(last_feat)
-            conf = "High" if score > 0.8 else "Medium" if score > 0.6 else "Low"
-            st.info(f"🤖 Predicted close: {pred:.2f} | Confidence: {conf} ({score:.2%})")
+    if signal == "BUY": st.success(f"✅ BUY — {reason}")
+    elif signal == "SELL": st.error(f"❌ SELL — {reason}")
+    else: st.warning(f"⚠️ HOLD — {reason}")
+    for i in insights: st.write(f"- {i}")
+    # Strength Meter Gauge
+    fig_gauge = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score_strength,
+        title={'text': "Technical Strength"},
+        gauge={'axis': {'range': [0, 100]},
+               'bar': {'color': "darkblue"},
+               'steps': [
+                   {'range': [0, 30], 'color': "red"},
+                   {'range': [30, 70], 'color': "yellow"},
+                   {'range': [70, 100], 'color': "green"}]}))
+    st.plotly_chart(fig_gauge, use_container_width=True)
 
 # News tab
 if enable_news:
     with t[3]:
-        st.subheader("📰 Common Market News")
         if news_source == "DuckDuckGo":
             for n in fetch_duckduckgo_news(f"{ticker_input} stock news"):
                 st.write(f"- [{n.get('title')}]({n.get('url')})")
@@ -277,19 +271,21 @@ if enable_news:
                 st.write(f"- [{n.get('title')}]({n.get('link')})")
         elif news_source == "EconomyNext business":
             for n in scrape_site("https://economynext.com/category/business/"):
-                st.write(f"- {n}")
+                st.write(f"- {n[0]} ({n[1]})")
         elif news_source == "EconomyNext market":
             for n in scrape_site("https://economynext.com/markets/"):
-                st.write(f"- {n}")
+                st.write(f"- {n[0]} ({n[1]})")
         elif news_source == "Bartleet Religare":
             for n in scrape_site("https://research.bartleetreligare.com/"):
-                st.write(f"- {n}")
-        st.subheader("🎯 Selected Share Related News")
-        ticker_upper = ticker_input.upper()
-        headlines = scrape_site("https://economynext.com/category/business/") + scrape_site("https://economynext.com/markets/")
-        filtered = [h for h in headlines if ticker_upper in h.upper()]
-        if filtered:
-            for h in filtered:
-                st.write(f"- {h}")
-        else:
-            st.write("No related news found.")
+                st.write(f"- {n[0]} ({n[1]})")
+
+# Company Details tab
+with t[-1]:
+    stockanalysis_symbol = convert_for_stockanalysis(ticker_input)
+    st.write(f"Fetching data from StockAnalysis for {stockanalysis_symbol}...")
+    company_info = scrape_stockanalysis(stockanalysis_symbol)
+    if company_info:
+        for k,v in company_info.items():
+            st.write(f"**{k}:** {v}")
+    else:
+        st.warning("No company info found.")

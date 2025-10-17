@@ -13,13 +13,6 @@ from bs4 import BeautifulSoup
 import warnings
 warnings.filterwarnings('ignore')
 
-# Optional DuckDuckGo import
-try:
-    from duckduckgo_search import ddg_news
-    duckduckgo_available = True
-except ImportError:
-    duckduckgo_available = False
-
 st.set_page_config(page_title="💹 AI + CSE Stock Dashboard", layout="wide")
 
 # ---------------- Helper Functions -----------------
@@ -135,7 +128,7 @@ class StockML:
     def predict_next(self, features):
         return self.model.predict(self.scaler.transform(features))[0]
 
-# News & Bartleet Religare
+# News & StockAnalysis scrapers
 def scrape_site(url):
     try:
         res = requests.get(url, timeout=10)
@@ -150,13 +143,6 @@ def scrape_site(url):
     except Exception:
         return []
 
-def fetch_duckduckgo_news(query):
-    if not duckduckgo_available: return []
-    try:
-        return ddg_news(query, max_results=7)
-    except Exception:
-        return []
-
 def fetch_yahoo_news(symbol):
     try:
         t = yf.Ticker(symbol)
@@ -164,25 +150,54 @@ def fetch_yahoo_news(symbol):
     except Exception:
         return []
 
-def scrape_stockanalysis(symbol_for_stockanalysis):
-    url = f"https://stockanalysis.com/quote/cose/{symbol_for_stockanalysis}/"
-    try:
-        res = requests.get(url, timeout=10)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        summary = {}
-        summary['Name'] = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
-        smalls = soup.find_all("small")
-        if smalls:
-            summary['Description'] = smalls[0].get_text(strip=True)
-        divs = soup.find_all("div", class_="snapshot__item")
-        for d in divs:
-            label = d.find("div", class_="label")
-            value = d.find("div", class_="value")
-            if label and value:
-                summary[label.get_text(strip=True)] = value.get_text(strip=True)
-        return summary
-    except Exception:
-        return {}
+def scrape_stockanalysis_sections(symbol_for_stockanalysis):
+    """Fetch multiple StockAnalysis pages for a given symbol and extract elements with data-title='overall' or fallbacks.
+
+    Returns a dict keyed by section names: 'overall', 'financials', 'dividend', 'company', 'statistics'.
+    """
+    base = f"https://stockanalysis.com/quote/cose/{symbol_for_stockanalysis}/"
+    paths = {'overall': base,
+             'financials': base + 'financials/',
+             'dividend': base + 'dividend/',
+             'company': base + 'company/',
+             'statistics': base + 'statistics/'}
+    result = {}
+    headers = {'User-Agent': 'ai-stock-dashboard/1.0'}
+    for name, url in paths.items():
+        try:
+            res = requests.get(url, timeout=10, headers=headers)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            # Primary extraction: find nodes with data-title="overall"
+            nodes = soup.find_all(attrs={"data-title": "overall"})
+            if nodes:
+                texts = []
+                for n in nodes:
+                    texts.append(' '.join(n.stripped_strings))
+                result[name] = '\n\n'.join(texts)
+                continue
+            # Secondary: try to extract snapshot items or summary dict as before
+            summary = {}
+            h1 = soup.find('h1')
+            if h1:
+                summary['Name'] = h1.get_text(strip=True)
+            smalls = soup.find_all('small')
+            if smalls:
+                summary['Description'] = smalls[0].get_text(strip=True)
+            divs = soup.find_all('div', class_='snapshot__item')
+            for d in divs:
+                label = d.find('div', class_='label')
+                value = d.find('div', class_='value')
+                if label and value:
+                    summary[label.get_text(strip=True)] = value.get_text(strip=True)
+            if summary:
+                result[name] = summary
+                continue
+            # Final fallback: first paragraph or empty string
+            p = soup.find('p')
+            result[name] = p.get_text(strip=True) if p else ''
+        except Exception:
+            result[name] = {}
+    return result
 
 # Sidebar controls
 st.sidebar.title("📊 Dashboard Controls")
@@ -193,7 +208,7 @@ start_date = st.sidebar.date_input("Start Date", date(2024, 1, 1))
 end_date = st.sidebar.date_input("End Date", date.today())
 show_prediction = st.sidebar.checkbox("🔮 Show ML Prediction", value=True)
 enable_news = st.sidebar.checkbox("📰 Show Market News", value=True)
-news_source = st.sidebar.selectbox("Choose News Source", ["DuckDuckGo", "Yahoo Finance", "EconomyNext business", "EconomyNext market", "Bartleet Religare"])
+news_source = st.sidebar.selectbox("Choose News Source", ["Yahoo Finance", "EconomyNext business", "EconomyNext market", "Bartleet Religare"])
 
 # Load data
 if upload_data is not None:
@@ -263,10 +278,7 @@ with t[2]:
 # News tab
 if enable_news:
     with t[3]:
-        if news_source == "DuckDuckGo":
-            for n in fetch_duckduckgo_news(f"{ticker_input} stock news"):
-                st.write(f"- [{n.get('title')}]({n.get('url')})")
-        elif news_source == "Yahoo Finance":
+        if news_source == "Yahoo Finance":
             for n in fetch_yahoo_news(ticker_input):
                 st.write(f"- [{n.get('title')}]({n.get('link')})")
         elif news_source == "EconomyNext business":
@@ -283,9 +295,17 @@ if enable_news:
 with t[-1]:
     stockanalysis_symbol = convert_for_stockanalysis(ticker_input)
     st.write(f"Fetching data from StockAnalysis for {stockanalysis_symbol}...")
-    company_info = scrape_stockanalysis(stockanalysis_symbol)
-    if company_info:
-        for k,v in company_info.items():
-            st.write(f"**{k}:** {v}")
+    company_info_sections = scrape_stockanalysis_sections(stockanalysis_symbol)
+    if company_info_sections:
+        for section, content in company_info_sections.items():
+            st.header(section.capitalize())
+            if isinstance(content, dict):
+                if content:
+                    for k,v in content.items():
+                        st.write(f"**{k}:** {v}")
+                else:
+                    st.write("No data found.")
+            else:
+                st.write(content or "No data found.")
     else:
         st.warning("No company info found.")

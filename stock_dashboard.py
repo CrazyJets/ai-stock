@@ -130,7 +130,7 @@ def scrape_economynext():
 # ---------- SIDEBAR ----------
 st.sidebar.header("CSE Input")
 ticker_input = st.sidebar.text_input("CSE Ticker (e.g. WIND-N0000):", "WIND-N0000")
-start_date = st.sidebar.date_input("Start Date", datetime.date(2022, 1, 1))
+start_date = st.sidebar.date_input("Start Date", datetime.date(2025, 1, 1))
 end_date = st.sidebar.date_input("End Date", datetime.date.today())
 use_websearch = st.sidebar.checkbox("Enable Web Search", value=False)
 

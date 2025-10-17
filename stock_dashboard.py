@@ -11,6 +11,18 @@ from sklearn.model_selection import train_test_split
 import requests
 from bs4 import BeautifulSoup
 import warnings
+import time
+import re
+from io import BytesIO
+from urllib.parse import urljoin, urlparse
+
+# PDF extraction
+from PyPDF2 import PdfReader
+
+# cloudscraper is helpful to handle common Cloudflare checks in a non-invasive manner.
+# If you don't have it in your environment, install: pip install cloudscraper
+import cloudscraper
+
 warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="💹 AI + CSE Stock Dashboard", layout="wide")
@@ -128,17 +140,59 @@ class StockML:
     def predict_next(self, features):
         return self.model.predict(self.scaler.transform(features))[0]
 
+# ---------------- Network helpers with Cloudflare handling ----------------
+SCRAPER = cloudscraper.create_scraper()  # handles many common Cloudflare checks
+
+def is_blocked_by_cf(text, status_code):
+    if status_code in (429, 503):
+        return True
+    block_signals = [
+        "cf-browser-verification",
+        "cloudflare",
+        "Checking your browser",
+        "Please enable JavaScript",
+        "bot verification",
+        "are you human"
+    ]
+    lower = text.lower()
+    return any(s in lower for s in block_signals)
+
+def get_html(url, use_scraper=True, timeout=15):
+    """Return (text, final_url, status_code) or (None, url, status) if blocked/fails."""
+    headers = {"User-Agent": "ai-stock-dashboard/1.0 (+https://github.com/CrazyJets)"}
+    try:
+        if use_scraper:
+            r = SCRAPER.get(url, timeout=timeout, headers=headers)
+        else:
+            r = requests.get(url, timeout=timeout, headers=headers)
+        text = r.text or ""
+        if is_blocked_by_cf(text, r.status_code):
+            return None, r.url, r.status_code
+        return text, r.url, r.status_code
+    except Exception:
+        # last-resort: try plain requests
+        try:
+            r = requests.get(url, timeout=timeout, headers=headers)
+            text = r.text or ""
+            if is_blocked_by_cf(text, r.status_code):
+                return None, r.url, r.status_code
+            return text, r.url, r.status_code
+        except Exception:
+            return None, url, None
+
 # News & StockAnalysis scrapers
 def scrape_site(url):
     try:
-        res = requests.get(url, timeout=10)
-        soup = BeautifulSoup(res.text, "html.parser")
+        text, final_url, status = get_html(url)
+        if text is None:
+            return []  # blocked or unavailable
+        soup = BeautifulSoup(text, "html.parser")
         links = []
         for a in soup.find_all("a", href=True):
-            text = a.text.strip()
-            link = a['href']
-            if text and (link.endswith(".pdf") or link.endswith(".jpg") or link.endswith(".png") or "pdf" in link):
-                links.append((text, link))
+            text_link = a.text.strip()
+            link = urljoin(final_url, a['href'])
+            if text_link and (link.lower().endswith(".pdf") or re.search(r"\.pdf(\?|$)", link.lower()) or 'pdf' in link.lower()):
+                links.append((text_link, link))
         return links
     except Exception:
         return []
@@ -153,7 +207,7 @@ def fetch_yahoo_news(symbol):
 def scrape_stockanalysis_sections(symbol_for_stockanalysis):
     """Fetch multiple StockAnalysis pages for a given symbol and extract elements with data-title='overall' or fallbacks.
 
-    Returns a dict keyed by section names: 'overall', 'financials', 'dividend', 'company', 'statistics'.
+    Uses the scraper that can handle Cloudflare checks. If the site appears blocked we fall back to yfinance info.
     """
     base = f"https://stockanalysis.com/quote/cose/{symbol_for_stockanalysis}/"
     paths = {'overall': base,
@@ -162,12 +216,14 @@ def scrape_stockanalysis_sections(symbol_for_stockanalysis):
              'company': base + 'company/',
              'statistics': base + 'statistics/'}
     result = {}
-    headers = {'User-Agent': 'ai-stock-dashboard/1.0'}
     for name, url in paths.items():
+        text, final_url, status = get_html(url, use_scraper=True)
+        if text is None:
+            # blocked or not accessible
+            result[name] = {"error": f"Blocked or unavailable (status={status}). Falling back to Yahoo Finance where possible."}
+            continue
         try:
-            res = requests.get(url, timeout=10, headers=headers)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            # Primary extraction: find nodes with data-title="overall"
+            soup = BeautifulSoup(text, 'html.parser')
             nodes = soup.find_all(attrs={"data-title": "overall"})
             if nodes:
                 texts = []
@@ -175,7 +231,7 @@ def scrape_stockanalysis_sections(symbol_for_stockanalysis):
                     texts.append(' '.join(n.stripped_strings))
                 result[name] = '\n\n'.join(texts)
                 continue
-            # Secondary: try to extract snapshot items or summary dict as before
+            # Secondary: snapshot items
             summary = {}
             h1 = soup.find('h1')
             if h1:
@@ -183,10 +239,10 @@ def scrape_stockanalysis_sections(symbol_for_stockanalysis):
             smalls = soup.find_all('small')
             if smalls:
                 summary['Description'] = smalls[0].get_text(strip=True)
-            divs = soup.find_all('div', class_='snapshot__item')
+            divs = soup.find_all('div', class_=re.compile(r'snapshot__item|snapshot-item'))
             for d in divs:
-                label = d.find('div', class_='label')
-                value = d.find('div', class_='value')
+                label = d.find('div', class_=re.compile(r'label|snapshot__label'))
+                value = d.find('div', class_=re.compile(r'value|snapshot__value'))
                 if label and value:
                     summary[label.get_text(strip=True)] = value.get_text(strip=True)
             if summary:
@@ -195,11 +251,121 @@ def scrape_stockanalysis_sections(symbol_for_stockanalysis):
             # Final fallback: first paragraph or empty string
             p = soup.find('p')
             result[name] = p.get_text(strip=True) if p else ''
+        except Exception as e:
+            result[name] = {"error": f"Parsing error: {e}"}
+    # If everything blocked, try to provide basic yfinance info for 'overall'
+    if all(isinstance(v, dict) and ('error' in v) for v in result.values()):
+        try:
+            ticker = yf.Ticker(symbol_for_stockanalysis)
+            info = dict(ticker.info or {})
+            result['yf_fallback'] = info
         except Exception:
-            result[name] = {}
+            result['yf_fallback'] = {}
     return result
 
-# Sidebar controls
+# ---------------- Bartleet Religare Reports scraping ----------------
+BARTLEET_BASE = "https://research.bartleetreligare.com/reports?category=market-updates"
+
+@st.cache_data(show_spinner=False)
+def download_bytes(url, use_scraper=True, timeout=20):
+    headers = {"User-Agent": "ai-stock-dashboard/1.0 (+https://github.com/CrazyJets)"}
+    try:
+        if use_scraper:
+            r = SCRAPER.get(url, timeout=timeout, headers=headers)
+        else:
+            r = requests.get(url, timeout=timeout, headers=headers)
+        if r.status_code != 200:
+            return None, r.status_code
+        return r.content, r.status_code
+    except Exception:
+        try:
+            r = requests.get(url, timeout=timeout, headers=headers)
+            if r.status_code != 200:
+                return None, r.status_code
+            return r.content, r.status_code
+        except Exception:
+            return None, None
+
+@st.cache_data(show_spinner=False)
+def extract_pdf_text_from_bytes(pdf_bytes):
+    if not pdf_bytes:
+        return ""
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        text_parts = []
+        for pg in reader.pages:
+            try:
+                t = pg.extract_text()
+                if t:
+                    text_parts.append(t)
+            except Exception:
+                continue
+        return "\n\n".join(text_parts)
+    except Exception as e:
+        return f"[PDF extraction error: {e}]"
+
+@st.cache_data(show_spinner=False)
+def fetch_bartleet_reports_list():
+    # Fetch the reports listing page and extract links to PDFs or report detail pages
+    text, final_url, status = get_html(BARTLEET_BASE)
+    results = []
+    if not text:
+        return results
+    soup = BeautifulSoup(text, "html.parser")
+    # Look for anchor tags that directly point to PDFs
+    for a in soup.find_all("a", href=True):
+        href = urljoin(final_url, a['href'])
+        title = a.get_text(strip=True) or href
+        if re.search(r"\.pdf(\?|$)", href.lower()):
+            results.append({"title": title, "url": href, "type": "pdf"})
+        else:
+            # Some report listings link to a report page. We'll store them too to be checked later.
+            # Heuristic: if URL path contains '/reports/' or '/report/', consider it a report page.
+            if "/report" in href or "/reports" in href:
+                results.append({"title": title, "url": href, "type": "page"})
+    # De-duplicate by URL while preserving order
+    seen = set()
+    deduped = []
+    for r in results:
+        if r["url"] not in seen:
+            deduped.append(r)
+            seen.add(r["url"])
+    return deduped
+
+@st.cache_data(show_spinner=False)
+def resolve_report_to_pdf(report_entry):
+    """Given an entry (pdf or page), return pdf_url (or None) and extracted text (or empty)."""
+    if report_entry["type"] == "pdf":
+        pdf_url = report_entry["url"]
+        content, status = download_bytes(pdf_url)
+        if content:
+            text = extract_pdf_text_from_bytes(content)
+            return pdf_url, text
+        return pdf_url, ""
+    # If it's a page, fetch it and look for PDF links or inline viewers
+    text, final_url, status = get_html(report_entry["url"])
+    if not text:
+        return None, ""
+    soup = BeautifulSoup(text, "html.parser")
+    # Look for direct PDF link in page
+    for a in soup.find_all("a", href=True):
+        href = urljoin(final_url, a['href'])
+        if re.search(r"\.pdf(\?|$)", href.lower()):
+            content, stcode = download_bytes(href)
+            if content:
+                return href, extract_pdf_text_from_bytes(content)
+    # Look for iframe that might embed a PDF
+    iframe = soup.find("iframe", src=True)
+    if iframe:
+        src = urljoin(final_url, iframe['src'])
+        if re.search(r"\.pdf(\?|$)", src.lower()):
+            content, stcode = download_bytes(src)
+            if content:
+                return src, extract_pdf_text_from_bytes(content)
+    # No PDF found
+    return None, ""
+
+# ---------------- Sidebar controls ----------------
 st.sidebar.title("📊 Dashboard Controls")
 upload_data = st.sidebar.file_uploader("📤 Upload CSV/Excel", type=["csv", "xlsx"])
 ticker_input = st.sidebar.text_input("Ticker", "WIND-N0000.CM")  # Yahoo format
@@ -209,6 +375,18 @@ end_date = st.sidebar.date_input("End Date", date.today())
 show_prediction = st.sidebar.checkbox("🔮 Show ML Prediction", value=True)
 enable_news = st.sidebar.checkbox("📰 Show Market News", value=True)
 news_source = st.sidebar.selectbox("Choose News Source", ["Yahoo Finance", "EconomyNext business", "EconomyNext market", "Bartleet Religare"])
+
+# Responsive small CSS tweaks for mobile
+st.markdown("""
+<style>
+/* Make header and content scale better on mobile */
+@media (max-width: 600px) {
+  .css-18e3th9 { padding: 8px 12px; } /* main content padding */
+  .stButton>button { padding: .45rem .8rem; }
+  .stTextInput>div>div>input { font-size: 14px; }
+}
+</style>
+""", unsafe_allow_html=True)
 
 # Load data
 if upload_data is not None:
@@ -248,7 +426,8 @@ with t[0]:
     fig.add_trace(go.Scatter(x=hist.index,y=hist['MACD_signal'],name="Signal"),row=2,col=1)
     fig.add_trace(go.Scatter(x=hist.index,y=hist['RSI'],name="RSI"),row=3,col=1)
     fig.update_layout(template="plotly_dark", height=800)
-    st.plotly_chart(fig, use_container_width=True)
+    # make plotly responsive
+    st.plotly_chart(fig, use_container_width=True, config={'responsive': True})
 
 # Indicators Hub tab
 with t[1]:
@@ -273,9 +452,9 @@ with t[2]:
                    {'range': [0, 30], 'color': "red"},
                    {'range': [30, 70], 'color': "yellow"},
                    {'range': [70, 100], 'color': "green"}]}))
-    st.plotly_chart(fig_gauge, use_container_width=True)
+    st.plotly_chart(fig_gauge, use_container_width=True, config={'responsive': True})
 
-# News tab
+# News tab (including Bartleet Religare)
 if enable_news:
     with t[3]:
         if news_source == "Yahoo Finance":
@@ -288,8 +467,23 @@ if enable_news:
             for n in scrape_site("https://economynext.com/markets/"):
                 st.write(f"- {n[0]} ({n[1]})")
         elif news_source == "Bartleet Religare":
-            for n in scrape_site("https://research.bartleetreligare.com/"):
-                st.write(f"- {n[0]} ({n[1]})")
+            st.write("Discovering Bartleet Religare market-updates reports (public PDFs where available)...")
+            reports = fetch_bartleet_reports_list()
+            if not reports:
+                st.warning("No reports discovered or page blocked/unavailable.")
+            else:
+                for r in reports:
+                    title = r.get("title") or r.get("url")
+                    st.markdown(f"**{title}**")
+                    st.write(r.get("url"))
+                    pdf_url, extracted_text = resolve_report_to_pdf(r)
+                    if pdf_url:
+                        # provide a simple download link + show first part of the text in an expander
+                        st.markdown(f"- PDF: {pdf_url}")
+                        with st.expander("Show extracted text (first 8000 chars)"):
+                            st.text(extracted_text[:8000] if extracted_text else "No text extracted.")
+                    else:
+                        st.info("No downloadable PDF found for this report (might be behind a viewer).")
 
 # Company Details tab
 with t[-1]:

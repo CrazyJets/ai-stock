@@ -17,7 +17,19 @@ from io import BytesIO
 from urllib.parse import urljoin, urlparse
 
 # PDF extraction
-from PyPDF2 import PdfReader
+# Try several PDF libraries gracefully. Streamlit environments sometimes don't have PyPDF2 installed.
+PdfReader = None
+USE_PYMUPDF = False
+try:
+    from PyPDF2 import PdfReader  # preferred
+except Exception:
+    try:
+        import fitz  # PyMuPDF as a fallback
+        USE_PYMUPDF = True
+    except Exception:
+        # Neither PyPDF2 nor PyMuPDF available. We'll handle this gracefully in extraction functions.
+        PdfReader = None
+        USE_PYMUPDF = False
 
 # cloudscraper is helpful to handle common Cloudflare checks in a non-invasive manner.
 # If you don't have it in your environment, install: pip install cloudscraper
@@ -288,21 +300,44 @@ def download_bytes(url, use_scraper=True, timeout=20):
 
 @st.cache_data(show_spinner=False)
 def extract_pdf_text_from_bytes(pdf_bytes):
+    """Extract text from PDF bytes using PyPDF2 or PyMuPDF when available.
+    If neither library is available, return a clear message so UI can skip/notify.
+    """
     if not pdf_bytes:
         return ""
-    try:
-        reader = PdfReader(BytesIO(pdf_bytes))
-        text_parts = []
-        for pg in reader.pages:
-            try:
-                t = pg.extract_text()
-                if t:
-                    text_parts.append(t)
-            except Exception:
-                continue
-        return "\n\n".join(text_parts)
-    except Exception as e:
-        return f"[PDF extraction error: {e}]"
+    # Try PyPDF2 if available
+    if PdfReader is not None:
+        try:
+            reader = PdfReader(BytesIO(pdf_bytes))
+            text_parts = []
+            for pg in reader.pages:
+                try:
+                    t = pg.extract_text()
+                    if t:
+                        text_parts.append(t)
+                except Exception:
+                    continue
+            return "\n\n".join(text_parts)
+        except Exception as e:
+            return f"[PDF extraction error (PyPDF2): {e}]"
+    # Try PyMuPDF (fitz) if available
+    if USE_PYMUPDF:
+        try:
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            text_parts = []
+            for page in doc:
+                try:
+                    t = page.get_text("text")
+                    if t:
+                        text_parts.append(t)
+                except Exception:
+                    continue
+            return "\n\n".join(text_parts)
+        except Exception as e:
+            return f"[PDF extraction error (PyMuPDF): {e}]"
+    # No library available
+    return "[PDF extraction not available: install PyPDF2 (pip install PyPDF2) or PyMuPDF (pip install pymupdf)]"
 
 @st.cache_data(show_spinner=False)
 def fetch_bartleet_reports_list():
@@ -334,13 +369,14 @@ def fetch_bartleet_reports_list():
 
 @st.cache_data(show_spinner=False)
 def resolve_report_to_pdf(report_entry):
-    """Given an entry (pdf or page), return pdf_url (or None) and extracted text (or empty)."""
+    """Given an entry (pdf or page), return pdf_url (or None) and extracted text (or an informative message)."""
     if report_entry["type"] == "pdf":
         pdf_url = report_entry["url"]
         content, status = download_bytes(pdf_url)
         if content:
             text = extract_pdf_text_from_bytes(content)
             return pdf_url, text
+        # If we couldn't download content, still return the url so user can try manually
         return pdf_url, ""
     # If it's a page, fetch it and look for PDF links or inline viewers
     text, final_url, status = get_html(report_entry["url"])
@@ -387,6 +423,10 @@ st.markdown("""
 }
 </style>
 """, unsafe_allow_html=True)
+
+# Inform user on availability of PDF extraction libraries (non-blocking)
+if not (PdfReader is not None or USE_PYMUPDF):
+    st.sidebar.info("PDF extraction libraries not found. PDF text extraction will be disabled. To enable, install PyPDF2 or PyMuPDF in your environment.")
 
 # Load data
 if upload_data is not None:
@@ -480,8 +520,11 @@ if enable_news:
                     if pdf_url:
                         # provide a simple download link + show first part of the text in an expander
                         st.markdown(f"- PDF: {pdf_url}")
-                        with st.expander("Show extracted text (first 8000 chars)"):
-                            st.text(extracted_text[:8000] if extracted_text else "No text extracted.")
+                        if extracted_text:
+                            with st.expander("Show extracted text (first 8000 chars)"):
+                                st.text(extracted_text[:8000] if extracted_text else "No text extracted.")
+                        else:
+                            st.info("No text extracted from PDF (could be behind viewer or extraction not available).")
                     else:
                         st.info("No downloadable PDF found for this report (might be behind a viewer).")
 

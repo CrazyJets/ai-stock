@@ -2,20 +2,22 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 import streamlit as st
-from datetime import datetime, timedelta, date
+from datetime import date
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+import requests
+from bs4 import BeautifulSoup
+from duckduckgo_search import ddg_news
 import warnings
 warnings.filterwarnings('ignore')
 
-# ----------------- PAGE CONFIG -----------------
+# ---------------- Streamlit Page Config -----------------
 st.set_page_config(page_title="AI + CSE Stock Dashboard", layout="wide")
 
-# ====================== HELPERS =======================
+# ---------------- Helper Functions -----------------
 def normalize_cse_ticker(ticker: str) -> str:
     if ticker and not ticker.upper().endswith(".CM"):
         return ticker.upper() + ".CM"
@@ -39,7 +41,7 @@ def get_yf_data(tkr: str, start: date, end: date):
         info = {}
     return hist, info
 
-# ============= Technical Indicators Functions =============
+# ---------------- Indicator Calculations -----------------
 def calculate_indicators(df):
     df['SMA_20'] = df['Close'].rolling(20).mean()
     df['SMA_50'] = df['Close'].rolling(50).mean()
@@ -56,6 +58,7 @@ def calculate_indicators(df):
     bb_std = df['Close'].rolling(20).std()
     df['BB_upper'] = bb_mid + (bb_std*2)
     df['BB_lower'] = bb_mid - (bb_std*2)
+    df['Vol_SMA'] = df['Volume'].rolling(20).mean()
     return df
 
 def zigzag_with_signals(df, threshold=0.03):
@@ -90,19 +93,44 @@ def buy_sell_signal(df):
     else:
         return "HOLD", f"No strong signal, RSI {latest_rsi:.2f}"
 
-# ================ ML MODEL =================
+# ---------------- AI Market Insights -----------------
+def ai_market_analysis(df, info, signal, reason):
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    pc = (latest['Close'] - prev['Close']) / prev['Close'] * 100
+    rsi = latest['RSI']
+    macd = latest['MACD']
+    macd_signal = latest['MACD_signal']
+    bb_upper = latest['BB_upper']
+    bb_lower = latest['BB_lower']
+    vol_ratio = latest['Volume'] / latest['Vol_SMA'] if latest['Vol_SMA'] else 1
+
+    insights = [f"Today change: {pc:+.2f}% ({signal}) — {reason}"]
+    if rsi > 70: insights.append(f"RSI {rsi:.1f} → Overbought risk")
+    elif rsi < 30: insights.append(f"RSI {rsi:.1f} → Oversold opportunity")
+    if latest['Close'] > bb_upper: insights.append("🚀 Price above Bollinger Upper → Possible reversal")
+    elif latest['Close'] < bb_lower: insights.append("📉 Price below Bollinger Lower → Potential bounce")
+    if macd > macd_signal: insights.append("MACD bullish momentum")
+    else: insights.append("MACD bearish momentum")
+    if vol_ratio > 1.5: insights.append("🔥 High volume confirms strong move")
+    elif vol_ratio < 0.7: insights.append("📊 Weak volume, possible false move")
+
+    mcap = info.get('marketCap', 0)
+    if mcap > 1e11: insights.append("🏢 Large-cap stability")
+    elif mcap > 1e9: insights.append("🏭 Mid-cap balance")
+    else: insights.append("📈 Small-cap volatility")
+
+    return insights
+
+# ---------------- ML Model -----------------
 class StockML:
     def __init__(self):
         self.scaler = StandardScaler()
         self.model = RandomForestRegressor(n_estimators=100, random_state=42)
 
     def prepare_data(self, df):
-        df['Returns'] = df['Close'].pct_change()
-        df['Close_lag1'] = df['Close'].shift(1)
-        df['Close_lag2'] = df['Close'].shift(2)
-        df['RSI'] = df['RSI'].fillna(method='bfill')
         df = df.dropna()
-        X = df[['Close_lag1', 'Close_lag2', 'RSI', 'MACD', 'MACD_signal']]
+        X = df[['Close','SMA_20','SMA_50','RSI','MACD','MACD_signal']]
         y = df['Close'].shift(-1).dropna()
         X = X.iloc[:-1]; y = y.iloc[:-1]
         return X, y
@@ -118,71 +146,117 @@ class StockML:
     def predict_next(self, features):
         return self.model.predict(self.scaler.transform(features))[0]
 
-# =================== UI =====================
-st.sidebar.title("📊 Stock Dashboard Controls")
-ticker_input = st.sidebar.text_input("Stock Ticker", "AAPL")
-use_cse = st.sidebar.checkbox("🇱🇰 Use CSE format (.CM)", value=False)
+# ---------------- News Functions -----------------
+@st.cache_data
+def fetch_duckduckgo_news(query):
+    try:
+        return ddg_news(query, max_results=7)
+    except Exception:
+        return []
+
+@st.cache_data
+def scrape_economynext():
+    try:
+        res = requests.get("https://economynext.com/category/business/", timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
+        return [a.text.strip() for a in soup.find_all("a", href=True) if a.text.strip()][:10]
+    except Exception:
+        return []
+
+# ---------------- Sidebar -----------------
+st.sidebar.title("📊 Controls")
+ticker_input = st.sidebar.text_input("Stock Ticker", "SAMP.N0000.CM")
+use_cse = st.sidebar.checkbox("🇱🇰 Use CSE format (.CM)", value=True)
 start_date = st.sidebar.date_input("Start Date", date(2024, 1, 1))
 end_date = st.sidebar.date_input("End Date", date.today())
-analysis_mode = st.sidebar.selectbox("Analysis Mode", ["AI Technical Dashboard", "Buy/Sell Signal Chart"])
 show_prediction = st.sidebar.checkbox("Show ML Prediction", value=True)
+enable_news = st.sidebar.checkbox("📰 Show Market News", value=True)
 
-# Adjust ticker for CSE if needed
 symbol = normalize_cse_ticker(ticker_input) if use_cse else ticker_input.upper()
-
 hist, info = get_yf_data(symbol, start_date, end_date)
-
 if hist.empty:
-    st.error("No data found for given ticker/range")
+    st.error("No data found for ticker/date range")
     st.stop()
 
-# Calculate indicators
 hist = calculate_indicators(hist)
 hist, pivots = zigzag_with_signals(hist)
 signal, reason = buy_sell_signal(hist)
+insights = ai_market_analysis(hist, info, signal, reason)
 
-# ========== Analysis Modes ==========
-if analysis_mode == "AI Technical Dashboard":
-    st.subheader(f"📈 {symbol} Technical Analysis")
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                        row_heights=[0.5,0.3,0.2],
-                        subplot_titles=(f"{symbol} Price", "MACD", "RSI"))
-    fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'],
-                                 low=hist['Low'], close=hist['Close']), row=1,col=1)
+# ---------------- Tabs -----------------
+tabs = ["📈 Chart", "📊 Indicators", "🧠 AI Analysis", "📊 Performance", "📋 Fundamentals"]
+if enable_news: tabs.append("📰 News")
+t = st.tabs(tabs)
+
+# Chart
+with t[0]:
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5,0.3,0.2])
+    fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close']), row=1,col=1)
     fig.add_trace(go.Scatter(x=hist.index,y=hist['SMA_20'],name="SMA20"),row=1,col=1)
     fig.add_trace(go.Scatter(x=hist.index,y=hist['SMA_50'],name="SMA50"),row=1,col=1)
+    fig.add_trace(go.Scatter(x=hist.index,y=hist['BB_upper'],name="BB Upper"),row=1,col=1)
+    fig.add_trace(go.Scatter(x=hist.index,y=hist['BB_lower'],name="BB Lower"),row=1,col=1)
     fig.add_trace(go.Scatter(x=hist.index,y=hist['MACD'],name="MACD"),row=2,col=1)
     fig.add_trace(go.Scatter(x=hist.index,y=hist['MACD_signal'],name="Signal"),row=2,col=1)
     fig.add_trace(go.Scatter(x=hist.index,y=hist['RSI'],name="RSI"),row=3,col=1)
-    fig.update_layout(template="plotly_dark",height=800)
-    st.plotly_chart(fig,use_container_width=True)
+    fig.update_layout(template="plotly_dark", height=800)
+    st.plotly_chart(fig, use_container_width=True)
 
-else:
-    st.subheader(f"📊 Buy/Sell Signals for {symbol}")
-    fig = go.Figure(go.Candlestick(x=hist.index,open=hist["Open"],high=hist["High"],low=hist["Low"],close=hist["Close"]))
-    for d,p,act in pivots:
-        fig.add_trace(go.Scatter(x=[d],y=[p],mode="markers+text",text=[act.upper()],
-                                 marker=dict(color="green" if act=="buy" else "red", size=10)))
-    st.plotly_chart(fig,use_container_width=True)
+# Indicators
+with t[1]:
+    st.dataframe(hist.tail(15))
+
+# AI Analysis
+with t[2]:
     st.markdown(f"**Recommendation:** {signal} — {reason}")
+    for insight in insights:
+        st.write(f"- {insight}")
+    if show_prediction:
+        ml = StockML()
+        res = ml.train(hist)
+        if res:
+            score, last_feat = res
+            pred = ml.predict_next(last_feat)
+            conf = "High" if score > 0.8 else "Medium" if score > 0.6 else "Low"
+            st.success(f"ML predicts next close: {pred:.2f} — Confidence: {conf} ({score:.2%})")
 
-# ========== ML Prediction ==========
-if show_prediction:
-    ml = StockML()
-    res = ml.train(hist)
-    if res:
-        score, last_feat = res
-        pred = ml.predict_next(last_feat)
-        st.success(f"ML predicts next close: ${pred:.2f} — Model R²: {score:.2%}")
-    else:
-        st.warning("Insufficient data for ML prediction")
+# Performance
+with t[3]:
+    hist['Daily_Returns'] = hist['Close'].pct_change()
+    hist['Cumulative_Returns'] = (1+hist['Daily_Returns']).cumprod() - 1
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Return", f"{hist['Cumulative_Returns'].iloc[-1]*100:.1f}%")
+    col2.metric("Volatility", f"{hist['Daily_Returns'].std()*np.sqrt(252)*100:.1f}%")
+    col3.metric("Sharpe Ratio", f"{(hist['Daily_Returns'].mean()*252)/(hist['Daily_Returns'].std()*np.sqrt(252)):.2f}")
+    col4.metric("Max Drawdown", f"{((hist['Close']/hist['Close'].expanding().max())-1).min()*100:.1f}%")
 
-# ====== EXTRA INFO =======
+# Fundamentals
+with t[4]:
+    st.subheader("Company Fundamentals")
+    fundamentals = {
+        "P/E Ratio": info.get('trailingPE'),
+        "Forward P/E": info.get('forwardPE'),
+        "PEG Ratio": info.get('pegRatio'),
+        "Price to Book": info.get('priceToBook'),
+        "Dividend Yield": info.get('dividendYield',0)*100,
+        "Beta": info.get('beta'),
+        "52W High": info.get('fiftyTwoWeekHigh'),
+        "52W Low": info.get('fiftyTwoWeekLow'),
+        "Market Cap": info.get('marketCap')
+    }
+    for k,v in fundamentals.items():
+        st.write(f"**{k}:** {v if v is not None else 'N/A'}")
+
+# News
+if enable_news and len(t) > 5:
+    with t[5]:
+        st.subheader("EconomyNext Headlines")
+        for hn in scrape_economynext():
+            st.write(f"- {hn}")
+        st.subheader(f"DuckDuckGo News for {symbol}")
+        for n in fetch_duckduckgo_news(f"{symbol} stock news"):
+            st.write(f"- [{n.get('title')}]({n.get('url')})")
+
+# Footer
 st.markdown("---")
-st.write("### Company Info")
-if info:
-    st.write(info.get("longName",symbol))
-    st.write(f"Sector: {info.get('sector','N/A')}")
-    st.write(f"Market Cap: {info.get('marketCap','N/A')}")
-else:
-    st.write("No company info available.")
+st.markdown("<center>⚠️ Educational use only. Not financial advice.</center>", unsafe_allow_html=True)

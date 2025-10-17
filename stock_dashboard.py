@@ -1,4 +1,3 @@
- url=https://github.com/CrazyJets/ai-stock/blob/356c797ff598f92e855c168eb5865a6f75c8df02/stock_dashboard.py
 import yfinance as yf
 import pandas as pd
 import numpy as np

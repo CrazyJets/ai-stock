@@ -10,11 +10,16 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 import requests
 from bs4 import BeautifulSoup
-from duckduckgo_search import ddg_news
 import warnings
 warnings.filterwarnings('ignore')
 
-# ---------------- Streamlit Page Config -----------------
+# Safe import of DuckDuckGo
+try:
+    from duckduckgo_search import ddg_news
+    duckduckgo_available = True
+except ImportError:
+    duckduckgo_available = False
+
 st.set_page_config(page_title="AI + CSE Stock Dashboard", layout="wide")
 
 # ---------------- Helper Functions -----------------
@@ -93,7 +98,7 @@ def buy_sell_signal(df):
     else:
         return "HOLD", f"No strong signal, RSI {latest_rsi:.2f}"
 
-# ---------------- AI Market Insights -----------------
+# AI Market Insights
 def ai_market_analysis(df, info, signal, reason):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
@@ -105,7 +110,7 @@ def ai_market_analysis(df, info, signal, reason):
     bb_lower = latest['BB_lower']
     vol_ratio = latest['Volume'] / latest['Vol_SMA'] if latest['Vol_SMA'] else 1
 
-    insights = [f"Today change: {pc:+.2f}% ({signal}) — {reason}"]
+    insights = [f"Today change: {pc:+.2f}% → {signal} — {reason}"]
     if rsi > 70: insights.append(f"RSI {rsi:.1f} → Overbought risk")
     elif rsi < 30: insights.append(f"RSI {rsi:.1f} → Oversold opportunity")
     if latest['Close'] > bb_upper: insights.append("🚀 Price above Bollinger Upper → Possible reversal")
@@ -114,27 +119,23 @@ def ai_market_analysis(df, info, signal, reason):
     else: insights.append("MACD bearish momentum")
     if vol_ratio > 1.5: insights.append("🔥 High volume confirms strong move")
     elif vol_ratio < 0.7: insights.append("📊 Weak volume, possible false move")
-
     mcap = info.get('marketCap', 0)
     if mcap > 1e11: insights.append("🏢 Large-cap stability")
     elif mcap > 1e9: insights.append("🏭 Mid-cap balance")
     else: insights.append("📈 Small-cap volatility")
-
     return insights
 
-# ---------------- ML Model -----------------
+# ML Model
 class StockML:
     def __init__(self):
         self.scaler = StandardScaler()
         self.model = RandomForestRegressor(n_estimators=100, random_state=42)
-
     def prepare_data(self, df):
         df = df.dropna()
         X = df[['Close','SMA_20','SMA_50','RSI','MACD','MACD_signal']]
         y = df['Close'].shift(-1).dropna()
         X = X.iloc[:-1]; y = y.iloc[:-1]
         return X, y
-
     def train(self, df):
         X, y = self.prepare_data(df)
         if len(X) < 30: return None
@@ -142,13 +143,13 @@ class StockML:
         self.model.fit(self.scaler.fit_transform(X_train), y_train)
         score = self.model.score(self.scaler.transform(X_test), y_test)
         return score, X.iloc[-1:]
-
     def predict_next(self, features):
         return self.model.predict(self.scaler.transform(features))[0]
 
-# ---------------- News Functions -----------------
+# News functions
 @st.cache_data
 def fetch_duckduckgo_news(query):
+    if not duckduckgo_available: return []
     try:
         return ddg_news(query, max_results=7)
     except Exception:
@@ -163,32 +164,52 @@ def scrape_economynext():
     except Exception:
         return []
 
+def fetch_yahoo_news(symbol):
+    try:
+        t = yf.Ticker(symbol)
+        return t.news
+    except Exception:
+        return []
+
 # ---------------- Sidebar -----------------
 st.sidebar.title("📊 Controls")
-ticker_input = st.sidebar.text_input("Stock Ticker", "SAMP.N0000.CM")
-use_cse = st.sidebar.checkbox("🇱🇰 Use CSE format (.CM)", value=True)
+upload_data = st.sidebar.file_uploader("Upload CSV/Excel for Custom Analysis", type=["csv", "xlsx"])
+ticker_input = st.sidebar.text_input("Stock Ticker", "AAPL")
+use_cse = st.sidebar.checkbox("🇱🇰 Use CSE format (.CM)", value=False)
 start_date = st.sidebar.date_input("Start Date", date(2024, 1, 1))
 end_date = st.sidebar.date_input("End Date", date.today())
 show_prediction = st.sidebar.checkbox("Show ML Prediction", value=True)
 enable_news = st.sidebar.checkbox("📰 Show Market News", value=True)
+news_source = st.sidebar.radio("Choose News Source", ["DuckDuckGo", "Yahoo Finance", "EconomyNext"])
 
-symbol = normalize_cse_ticker(ticker_input) if use_cse else ticker_input.upper()
-hist, info = get_yf_data(symbol, start_date, end_date)
+# Data loading
+if upload_data is not None:
+    if upload_data.name.endswith(".csv"):
+        hist = pd.read_csv(upload_data, parse_dates=[0])
+    else:
+        hist = pd.read_excel(upload_data, parse_dates=[0])
+    hist = hist.set_index(hist.columns[0])
+    info = {}
+else:
+    symbol = normalize_cse_ticker(ticker_input) if use_cse else ticker_input.upper()
+    hist, info = get_yf_data(symbol, start_date, end_date)
+
 if hist.empty:
-    st.error("No data found for ticker/date range")
+    st.error("No data found or dataset empty")
     st.stop()
 
+# Indicator & signals
 hist = calculate_indicators(hist)
 hist, pivots = zigzag_with_signals(hist)
 signal, reason = buy_sell_signal(hist)
 insights = ai_market_analysis(hist, info, signal, reason)
 
 # ---------------- Tabs -----------------
-tabs = ["📈 Chart", "📊 Indicators", "🧠 AI Analysis", "📊 Performance", "📋 Fundamentals"]
+tabs = ["📈 Chart", "📊 Indicators", "🧠 AI Analysis", "📊 Performance"]
 if enable_news: tabs.append("📰 News")
 t = st.tabs(tabs)
 
-# Chart
+# Chart tab
 with t[0]:
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5,0.3,0.2])
     fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close']), row=1,col=1)
@@ -202,7 +223,7 @@ with t[0]:
     fig.update_layout(template="plotly_dark", height=800)
     st.plotly_chart(fig, use_container_width=True)
 
-# Indicators
+# Indicators tab
 with t[1]:
     st.dataframe(hist.tail(15))
 
@@ -220,7 +241,7 @@ with t[2]:
             conf = "High" if score > 0.8 else "Medium" if score > 0.6 else "Low"
             st.success(f"ML predicts next close: {pred:.2f} — Confidence: {conf} ({score:.2%})")
 
-# Performance
+# Performance tab
 with t[3]:
     hist['Daily_Returns'] = hist['Close'].pct_change()
     hist['Cumulative_Returns'] = (1+hist['Daily_Returns']).cumprod() - 1
@@ -230,32 +251,21 @@ with t[3]:
     col3.metric("Sharpe Ratio", f"{(hist['Daily_Returns'].mean()*252)/(hist['Daily_Returns'].std()*np.sqrt(252)):.2f}")
     col4.metric("Max Drawdown", f"{((hist['Close']/hist['Close'].expanding().max())-1).min()*100:.1f}%")
 
-# Fundamentals
-with t[4]:
-    st.subheader("Company Fundamentals")
-    fundamentals = {
-        "P/E Ratio": info.get('trailingPE'),
-        "Forward P/E": info.get('forwardPE'),
-        "PEG Ratio": info.get('pegRatio'),
-        "Price to Book": info.get('priceToBook'),
-        "Dividend Yield": info.get('dividendYield',0)*100,
-        "Beta": info.get('beta'),
-        "52W High": info.get('fiftyTwoWeekHigh'),
-        "52W Low": info.get('fiftyTwoWeekLow'),
-        "Market Cap": info.get('marketCap')
-    }
-    for k,v in fundamentals.items():
-        st.write(f"**{k}:** {v if v is not None else 'N/A'}")
-
-# News
-if enable_news and len(t) > 5:
-    with t[5]:
-        st.subheader("EconomyNext Headlines")
-        for hn in scrape_economynext():
-            st.write(f"- {hn}")
-        st.subheader(f"DuckDuckGo News for {symbol}")
-        for n in fetch_duckduckgo_news(f"{symbol} stock news"):
-            st.write(f"- [{n.get('title')}]({n.get('url')})")
+# News tab
+if enable_news and tabs[-1] == "📰 News":
+    with t[4]:
+        if news_source == "DuckDuckGo":
+            if not duckduckgo_available:
+                st.warning("DuckDuckGo library not available in this environment.")
+            else:
+                for n in fetch_duckduckgo_news(f"{ticker_input} stock news"):
+                    st.write(f"- [{n.get('title')}]({n.get('url')})")
+        elif news_source == "Yahoo Finance":
+            for n in fetch_yahoo_news(ticker_input):
+                st.write(f"- [{n.get('title')}]({n.get('link')})")
+        elif news_source == "EconomyNext":
+            for hn in scrape_economynext():
+                st.write(f"- {hn}")
 
 # Footer
 st.markdown("---")

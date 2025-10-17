@@ -1,3 +1,4 @@
+ url=https://github.com/CrazyJets/ai-stock/blob/356c797ff598f92e855c168eb5865a6f75c8df02/stock_dashboard.py
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -32,8 +33,33 @@ except Exception:
         USE_PYMUPDF = False
 
 # cloudscraper is helpful to handle common Cloudflare checks in a non-invasive manner.
-# If you don't have it in your environment, install: pip install cloudscraper
-import cloudscraper
+# If you don't have it in your environment, we fall back to a simple requests-based scraper.
+# To enable the Cloudflare-handling scraper, install: pip install cloudscraper
+HAS_CLOUDSCRAPER = False
+SCRAPER = None
+try:
+    import cloudscraper
+    HAS_CLOUDSCRAPER = True
+    # create_scraper may raise in odd environments; guard it
+    try:
+        SCRAPER = cloudscraper.create_scraper()
+    except Exception:
+        SCRAPER = None
+        HAS_CLOUDSCRAPER = False
+except Exception:
+    cloudscraper = None
+    HAS_CLOUDSCRAPER = False
+    SCRAPER = None
+
+# Fallback simple scraper wrapper to provide .get() when cloudscraper isn't available.
+class _RequestsScraper:
+    def get(self, url, timeout=15, headers=None, **kwargs):
+        # Mirror requests.Response interface for our callers
+        return requests.get(url, timeout=timeout, headers=headers or {}, **kwargs)
+
+# Ensure SCRAPER is set to something with a .get method
+if SCRAPER is None:
+    SCRAPER = _RequestsScraper()
 
 warnings.filterwarnings('ignore')
 
@@ -153,8 +179,6 @@ class StockML:
         return self.model.predict(self.scaler.transform(features))[0]
 
 # ---------------- Network helpers with Cloudflare handling ----------------
-SCRAPER = cloudscraper.create_scraper()  # handles many common Cloudflare checks
-
 def is_blocked_by_cf(text, status_code):
     if status_code in (429, 503):
         return True
@@ -166,21 +190,24 @@ def is_blocked_by_cf(text, status_code):
         "bot verification",
         "are you human"
     ]
-    lower = text.lower()
+    lower = (text or "").lower()
     return any(s in lower for s in block_signals)
 
 def get_html(url, use_scraper=True, timeout=15):
     """Return (text, final_url, status_code) or (None, url, status) if blocked/fails."""
     headers = {"User-Agent": "ai-stock-dashboard/1.0 (+https://github.com/CrazyJets)"}
     try:
-        if use_scraper:
+        if use_scraper and HAS_CLOUDSCRAPER:
             r = SCRAPER.get(url, timeout=timeout, headers=headers)
         else:
-            r = requests.get(url, timeout=timeout, headers=headers)
-        text = r.text or ""
-        if is_blocked_by_cf(text, r.status_code):
-            return None, r.url, r.status_code
-        return text, r.url, r.status_code
+            # Use SCRAPER (requests-based fallback) or plain requests
+            r = SCRAPER.get(url, timeout=timeout, headers=headers)
+        text = getattr(r, "text", None) or ""
+        final_url = getattr(r, "url", url)
+        status_code = getattr(r, "status_code", None)
+        if is_blocked_by_cf(text, status_code):
+            return None, final_url, status_code
+        return text, final_url, status_code
     except Exception:
         # last-resort: try plain requests
         try:
@@ -282,13 +309,14 @@ BARTLEET_BASE = "https://research.bartleetreligare.com/reports?category=market-u
 def download_bytes(url, use_scraper=True, timeout=20):
     headers = {"User-Agent": "ai-stock-dashboard/1.0 (+https://github.com/CrazyJets)"}
     try:
-        if use_scraper:
+        if use_scraper and HAS_CLOUDSCRAPER:
             r = SCRAPER.get(url, timeout=timeout, headers=headers)
         else:
-            r = requests.get(url, timeout=timeout, headers=headers)
-        if r.status_code != 200:
-            return None, r.status_code
-        return r.content, r.status_code
+            r = SCRAPER.get(url, timeout=timeout, headers=headers)
+        status_code = getattr(r, "status_code", None)
+        if status_code != 200:
+            return None, status_code
+        return getattr(r, "content", None), status_code
     except Exception:
         try:
             r = requests.get(url, timeout=timeout, headers=headers)
@@ -427,6 +455,10 @@ st.markdown("""
 # Inform user on availability of PDF extraction libraries (non-blocking)
 if not (PdfReader is not None or USE_PYMUPDF):
     st.sidebar.info("PDF extraction libraries not found. PDF text extraction will be disabled. To enable, install PyPDF2 or PyMuPDF in your environment.")
+
+# Inform user about cloudscraper availability
+if not HAS_CLOUDSCRAPER:
+    st.sidebar.info("Cloudscraper not available. Requests-based fallback will be used; some Cloudflare-protected sites may block access. To enable better scraping, install cloudscraper (pip install cloudscraper).")
 
 # Load data
 if upload_data is not None:

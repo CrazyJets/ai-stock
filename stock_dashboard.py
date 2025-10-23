@@ -751,15 +751,3 @@ with t[-1]:
                     st.write(f"**{k}:** {info.get(k)}")
         else:
             st.warning("No company info found via Yahoo Finance.")
-# End of file
-````markdown name=CHANGELOG.md
-```markdown
-# Changelog
-
-## Unreleased
-- Improve cse.lk integration handling and user messaging
-- Add "Normalize ticker for selected platform" button and "Auto-map .CM" checkbox
-- Add resilient Yahoo fallback trying multiple ticker variants
-- Fix cloudscraper sidebar message truncation bug
-- Defensive checks to avoid crashes when indicator columns missing
-- Add CHANGELOG and PR notes

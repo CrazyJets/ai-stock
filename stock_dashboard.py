@@ -4,7 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
-from datetime import date, datetime
+from datetime import date
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -308,199 +308,12 @@ def get_cse_company_details(cse_symbol: str):
     except Exception as e:
         return {"error": f"cse.lk call failed: {e}"}
 
-def _to_df_from_records(records, date_key_candidates=("date", "Date", "timestamp", "datetime")):
-    """Helper to convert list-of-dicts records to a DataFrame with Date index and OHLCV columns if possible."""
-    if not records:
-        return pd.DataFrame()
-    try:
-        df = pd.DataFrame(records)
-        # identify date column
-        date_col = None
-        for c in date_key_candidates:
-            if c in df.columns:
-                date_col = c
-                break
-        if date_col:
-            df[date_col] = pd.to_datetime(df[date_col])
-            df = df.set_index(date_col).sort_index()
-        # normalize column names to standard OHLCV names
-        colmap = {}
-        for c in df.columns:
-            cl = c.lower()
-            if "open" in cl and "open" not in colmap:
-                colmap[c] = "Open"
-            elif "high" in cl and "high" not in colmap:
-                colmap[c] = "High"
-            elif "low" in cl and "low" not in colmap:
-                colmap[c] = "Low"
-            elif ("close" in cl or "price" in cl) and "Close" not in colmap:
-                colmap[c] = "Close"
-            elif "volume" in cl and "Volume" not in colmap:
-                colmap[c] = "Volume"
-        df = df.rename(columns=colmap)
-        # ensure columns exist
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col not in df.columns:
-                df[col] = np.nan
-        df = df[["Open", "High", "Low", "Close", "Volume"]]
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-def get_cse_history(cse_symbol: str, start_dt: date, end_dt: date):
-    """Try multiple approaches to retrieve historical price data from the cse.lk package.
-    Returns (df, meta) where df is DataFrame or empty DataFrame on failure, meta is dict with debug info.
-    """
-    meta = {"attempts": [], "used": None}
-    if not CSE_AVAILABLE or CSE_MODULE is None:
-        meta["attempts"].append("cse.lk not installed")
-        return pd.DataFrame(), meta
-
-    # Convert dates to strings if needed
-    start_str = start_dt.isoformat()
-    end_str = end_dt.isoformat()
-
-    # Candidate function names / patterns to try
-    candidates = [
-        ("historical_prices", lambda mod: getattr(mod, "historical_prices", None)),
-        ("get_history", lambda mod: getattr(mod, "get_history", None)),
-        ("get_stock_history", lambda mod: getattr(mod, "get_stock_history", None)),
-        ("historical", lambda mod: getattr(mod, "historical", None)),
-        ("prices", lambda mod: getattr(mod, "prices", None)),
-        ("fetch_prices", lambda mod: getattr(mod, "fetch_prices", None)),
-    ]
-    # Also try if module has a Client or API class that can be constructed
-    try:
-        # If module exposes a function that accepts (symbol, start, end)
-        for name, getter in candidates:
-            fn = getter(CSE_MODULE)
-            if fn is None:
-                meta["attempts"].append(f"{name}: not found")
-                continue
-            meta["attempts"].append(f"{name}: found, trying call")
-            try:
-                # Try typical signatures
-                try:
-                    res = fn(cse_symbol, start_str, end_str)
-                except TypeError:
-                    try:
-                        res = fn(symbol=cse_symbol, start=start_str, end=end_str)
-                    except TypeError:
-                        try:
-                            res = fn(cse_symbol)
-                        except Exception as e:
-                            raise
-                # Normalize result
-                if isinstance(res, pd.DataFrame):
-                    meta["used"] = name
-                    df = res.copy()
-                    # if index isn't datetime, try to find a date column
-                    if not pd.api.types.is_datetime64_any_dtype(df.index):
-                        df = _to_df_from_records(df.reset_index().to_dict(orient="records"))
-                    else:
-                        # try to standardize column names
-                        cols_lower = {c.lower(): c for c in df.columns}
-                        rename = {}
-                        for k in cols_lower:
-                            if "close" in k and "Close" not in df.columns:
-                                rename[cols_lower[k]] = "Close"
-                            if "open" in k and "Open" not in df.columns:
-                                rename[cols_lower[k]] = "Open"
-                            if "high" in k and "High" not in df.columns:
-                                rename[cols_lower[k]] = "High"
-                            if "low" in k and "Low" not in df.columns:
-                                rename[cols_lower[k]] = "Low"
-                            if "volume" in k and "Volume" not in df.columns:
-                                rename[cols_lower[k]] = "Volume"
-                        if rename:
-                            df = df.rename(columns=rename)
-                        # ensure OHLCV presence
-                        for col in ["Open", "High", "Low", "Close", "Volume"]:
-                            if col not in df.columns:
-                                df[col] = np.nan
-                        df = df[["Open", "High", "Low", "Close", "Volume"]]
-                    return df.sort_index(), meta
-                # If it's list-of-dicts
-                if isinstance(res, (list, tuple)):
-                    df = _to_df_from_records(list(res))
-                    if not df.empty:
-                        meta["used"] = name
-                        return df.sort_index(), meta
-                # If it's an object with .to_dataframe or .to_df
-                if hasattr(res, "to_dataframe"):
-                    try:
-                        df = res.to_dataframe()
-                        if isinstance(df, pd.DataFrame) and not df.empty:
-                            meta["used"] = name
-                            return df.sort_index(), meta
-                    except Exception:
-                        pass
-                if hasattr(res, "to_df"):
-                    try:
-                        df = res.to_df()
-                        if isinstance(df, pd.DataFrame) and not df.empty:
-                            meta["used"] = name
-                            return df.sort_index(), meta
-                    except Exception:
-                        pass
-                # If returns dict with 'history' key
-                if isinstance(res, dict) and "history" in res:
-                    df = _to_df_from_records(res["history"])
-                    if not df.empty:
-                        meta["used"] = name
-                        return df.sort_index(), meta
-                # fallback: attempt to parse repr for csv-like data (unlikely)
-                meta["attempts"].append(f"{name}: unrecognized return type {type(res)}")
-            except Exception as e:
-                meta["attempts"].append(f"{name}: call failed: {e}")
-        # Try client pattern
-        if hasattr(CSE_MODULE, "Client") or hasattr(CSE_MODULE, "CSEClient") or hasattr(CSE_MODULE, "API"):
-            for cls_name in ("Client", "CSEClient", "API"):
-                cls = getattr(CSE_MODULE, cls_name, None)
-                if cls is None:
-                    meta["attempts"].append(f"{cls_name}: not found")
-                    continue
-                meta["attempts"].append(f"{cls_name}: found, attempting instantiation")
-                try:
-                    client = cls()
-                    if hasattr(client, "historical_prices"):
-                        try:
-                            res = client.historical_prices(cse_symbol, start_str, end_str)
-                            df = res if isinstance(res, pd.DataFrame) else _to_df_from_records(res)
-                            if not df.empty:
-                                meta["used"] = f"{cls_name}.historical_prices"
-                                return df.sort_index(), meta
-                        except Exception as e:
-                            meta["attempts"].append(f"{cls_name}.historical_prices call failed: {e}")
-                    # try other client methods
-                    for method in ("get_history", "get_stock_history", "historical"):
-                        m = getattr(client, method, None)
-                        if m is None:
-                            meta["attempts"].append(f"{cls_name}.{method}: not found")
-                            continue
-                        try:
-                            res = m(cse_symbol, start_str, end_str)
-                            df = res if isinstance(res, pd.DataFrame) else _to_df_from_records(res)
-                            if not df.empty:
-                                meta["used"] = f"{cls_name}.{method}"
-                                return df.sort_index(), meta
-                        except Exception as e:
-                            meta["attempts"].append(f"{cls_name}.{method} call failed: {e}")
-                except Exception as e:
-                    meta["attempts"].append(f"{cls_name}: instantiation failed: {e}")
-    except Exception as e:
-        meta["attempts"].append(f"unexpected error: {e}")
-
-    # Nothing worked
-    meta["attempts"].append("no recognized history API returned data")
-    return pd.DataFrame(), meta
-
 # ---------------- Sidebar controls ----------------
 st.sidebar.title("📊 Dashboard Controls")
 upload_data = st.sidebar.file_uploader("📤 Upload CSV/Excel", type=["csv", "xlsx"])
 ticker_input = st.sidebar.text_input("Ticker", "WIND-N0000.CM")  # user-friendly initial value
 platform = st.sidebar.selectbox("Choose platform", ["Yahoo Finance", "CSE (Colombo Stock Exchange)"])
-use_cse_checkbox = (platform.startswith("CSE"))
+use_cse_checkbox = (platform == "CSE")
 start_date = st.sidebar.date_input("Start Date", date(2024, 1, 1))
 end_date = st.sidebar.date_input("End Date", date.today())
 show_prediction = st.sidebar.checkbox("🔮 Show ML Prediction", value=True)
@@ -527,10 +340,6 @@ if not (PdfReader is not None or USE_PYMUPDF):
 if not HAS_CLOUDSCRAPER:
     st.sidebar.info("Cloudscraper not available. Requests-based fallback will be used; some Cloudflare-protected sites may block access. To enable better scraping, install cloudscraper (pip install cloudscraper).")
 
-# Inform user about cse.lk status
-if not CSE_AVAILABLE:
-    st.sidebar.info("cse.lk not found. To enable CSE price/company data, install: pip install cse.lk")
-
 # Load data
 if upload_data is not None:
     if upload_data.name.endswith(".csv"):
@@ -540,37 +349,12 @@ if upload_data is not None:
     hist = hist.set_index(hist.columns[0])
     info = {}
 else:
-    # Normalize ticker according to selected platform and try to fetch data
-    if platform.startswith("CSE"):
+    # Normalize ticker according to selected platform.
+    if platform == "CSE":
         # For the UI we accept SAMP-N0000 or SAMP.N0000 or SAMP N0000. Use a clean CSE form for cse.lk package.
         cse_symbol = normalize_cse_ticker_for_cselk(ticker_input)
         yf_symbol = normalize_cse_ticker_for_yf(ticker_input)  # Yahoo requires .CM suffix for CSE tickers
-
-        # First: attempt to fetch history using cse.lk
-        st.sidebar.write("Attempting to load historical prices from cse.lk package (if installed)...")
-        hist_cse, meta = get_cse_history(cse_symbol, start_date, end_date)
-        if not hist_cse.empty:
-            # Ensure index and numeric types
-            try:
-                hist = hist_cse.copy()
-                # if index is not datetime, try to convert
-                if not pd.api.types.is_datetime64_any_dtype(hist.index):
-                    hist.index = pd.to_datetime(hist.index)
-                hist = hist.sort_index()
-                # ensure column types numeric
-                for col in ['Open','High','Low','Close','Volume']:
-                    if col in hist.columns:
-                        hist[col] = pd.to_numeric(hist[col], errors='coerce')
-                info = {"source": "cse.lk", "cse_meta": meta}
-                st.sidebar.success(f"Loaded {len(hist)} rows from cse.lk (method: {meta.get('used')}).")
-            except Exception as e:
-                st.sidebar.error(f"Failed to normalize cse.lk data: {e}")
-                hist = pd.DataFrame()
-                info = {}
-        else:
-            # Fallback: use Yahoo
-            st.sidebar.warning("cse.lk history not available or failed. Falling back to Yahoo Finance for price history.")
-            hist, info = get_yf_data(yf_symbol, start_date, end_date)
+        hist, info = get_yf_data(yf_symbol, start_date, end_date)
     else:
         yf_symbol = normalize_general_ticker(ticker_input)
         hist, info = get_yf_data(yf_symbol, start_date, end_date)
@@ -650,7 +434,7 @@ if enable_news:
 
 # Company Details tab
 with t[-1]:
-    if platform.startswith("CSE"):
+    if platform == "CSE":
         cse_symbol = normalize_cse_ticker_for_cselk(ticker_input)
         st.write(f"Fetching CSE details for {cse_symbol} using cse.lk package (if installed)...")
         details = get_cse_company_details(cse_symbol)
@@ -682,4 +466,5 @@ with t[-1]:
                     st.write(f"**{k}:** {info.get(k)}")
         else:
             st.warning("No company info found via Yahoo Finance.")
+
 # End of file
